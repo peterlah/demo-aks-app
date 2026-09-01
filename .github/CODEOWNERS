@@ -5,6 +5,6 @@
 # 아래 REVIEWER-ACCOUNT 를 실제 승인자 계정으로 바꾸고,
 # 그 계정을 리포 Collaborator(write) 로 초대하세요.
 
-*            @REVIEWER-ACCOUNT
-/k8s/        @REVIEWER-ACCOUNT
-/.github/    @REVIEWER-ACCOUNT
+*            @Rarero
+/k8s/        @Rarero
+/.github/    @Rarero
