@@ -1,0 +1,298 @@
+name: CI/CD to Private AKS
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write   # OIDC 토큰 발급. 없으면 azure/login 이 실패한다.
+
+env:
+  IMAGE_NAME: demo-web
+  DEV_NS: demo-dev
+  PROD_NS: demo
+
+jobs:
+  preflight:
+    name: 준비
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+      image: ${{ steps.meta.outputs.image }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: meta
+        run: |
+          TAG="${GITHUB_SHA::7}"
+          IMAGE="${{ vars.ACR_NAME }}.azurecr.io/${IMAGE_NAME}:${TAG}"
+          echo "tag=$TAG"     >> "$GITHUB_OUTPUT"
+          echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
+          {
+            echo "### 빌드 대상"
+            echo "| 항목 | 값 |"
+            echo "|---|---|"
+            echo "| 이미지 | \`$IMAGE\` |"
+            echo "| 커밋 | \`$GITHUB_SHA\` |"
+            echo "| 트리거 | \`$GITHUB_ACTOR\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  build:
+    name: 이미지 빌드·푸시
+    needs: preflight
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Azure 로그인
+        uses: azure/login@v2
+        with:
+          client-id:       ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id:       ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: ACR 로그인
+        run: az acr login --name ${{ vars.ACR_NAME }}
+
+      - name: 빌드 및 푸시
+        run: |
+          IMAGE="${{ needs.preflight.outputs.image }}"
+          docker build -t "$IMAGE" ./app
+          docker push "$IMAGE"
+          echo "### 푸시 완료: \`$IMAGE\`" >> "$GITHUB_STEP_SUMMARY"
+
+  manifest-check:
+    name: 매니페스트 정적 검증
+    needs: preflight
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: kubeconform 설치
+        run: |
+          curl -sSLf https://github.com/yannh/kubeconform/releases/download/v0.6.7/kubeconform-linux-amd64.tar.gz \
+            | tar xz -C /usr/local/bin kubeconform
+
+      - name: 스키마 검증
+        run: |
+          kubeconform -strict -summary -output json k8s/*.yaml | tee kubeconform.json
+          {
+            echo "### 매니페스트 스키마 검증"
+            echo '```json'
+            cat kubeconform.json
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  scan:
+    name: 취약점 스캔
+    needs: [preflight, build]
+    runs-on: ubuntu-latest
+    # 취약점 DB 다운로드가 외부 요인으로 실패해도 배포 흐름은 유지한다.
+    # 차단 정책으로 전환하려면 이 줄을 제거하고 아래 --exit-code 를 1 로 올린다.
+    continue-on-error: true
+    steps:
+      - name: Azure 로그인
+        uses: azure/login@v2
+        with:
+          client-id:       ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id:       ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      # install.sh 는 존재하지 않는 태그를 넘겨도 "found version" 을 출력한 뒤
+      # 다운로드에서 exit 1 로 죽는다. 릴리스 에셋을 직접 받아 실패 지점을 명확히 한다.
+      - name: Trivy 설치
+        run: |
+          TRIVY_VERSION=0.74.0
+          curl -sSLf "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz" \
+            | sudo tar xz -C /usr/local/bin trivy
+          trivy --version
+
+      - name: 이미지 스캔
+        run: |
+          az acr login --name ${{ vars.ACR_NAME }}
+          IMAGE="${{ needs.preflight.outputs.image }}"
+          trivy image --severity HIGH,CRITICAL --exit-code 0 \
+                      --format table --scanners vuln "$IMAGE" | tee scan.txt
+          {
+            echo "### 취약점 스캔 (HIGH·CRITICAL)"
+            echo '```'
+            head -40 scan.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  deploy-dev:
+    name: dev 배포
+    needs: [preflight, scan, manifest-check]
+    runs-on: ubuntu-latest
+    environment:
+      name: dev
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/login@v2
+        with:
+          client-id:       ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id:       ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: 매니페스트 렌더링
+        run: |
+          mkdir -p out
+          sed -e "s|REPLACE_ACR.azurecr.io/demo-web:v1|${{ needs.preflight.outputs.image }}|" \
+              -e "s|namespace: demo$|namespace: ${DEV_NS}|" \
+              k8s/deployment.yaml > out/deployment.yaml
+          sed -e "s|namespace: demo$|namespace: ${DEV_NS}|" k8s/service.yaml > out/service.yaml
+          grep -E "namespace:|image:" out/*.yaml
+
+      - name: 배포
+        working-directory: out
+        run: |
+          # az aks command invoke 는 클러스터 안 명령이 실패해도 CLI 자신은 exit 0 을
+          # 반환한다. exitCode 를 읽어 전파하지 않으면 배포 실패가 성공으로 보고된다.
+          out=$(az aks command invoke -g ${{ vars.AKS_RG }} -n ${{ vars.AKS_NAME }} --file . \
+            --command "kubectl apply -f service.yaml -f deployment.yaml && kubectl rollout status deploy/demo-web -n ${DEV_NS} --timeout=180s" -o json)
+          echo "$out" | jq -r '.logs'
+          exit "$(echo "$out" | jq -r '.exitCode')"
+
+  smoke-dev:
+    name: dev 스모크 테스트
+    needs: [preflight, deploy-dev]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: azure/login@v2
+        with:
+          client-id:       ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id:       ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: 서비스 응답 확인
+        run: |
+          # snet-aks 의 방화벽 규칙은 AzureKubernetesService FQDN 태그만 허용하므로
+          # 노드가 Docker Hub 에서 새 이미지를 받을 수 없다. 기존 Pod 의 curl 을 사용한다.
+          out=$(az aks command invoke -g ${{ vars.AKS_RG }} -n ${{ vars.AKS_NAME }} \
+            --command "kubectl exec deploy/demo-web -n ${DEV_NS} -- curl -sS -w '\nHTTP=%{http_code}\n' http://demo-web.${DEV_NS}.svc.cluster.local" -o json)
+          LOGS=$(echo "$out" | jq -r '.logs')
+          echo "$LOGS"
+          echo "$LOGS" | grep -q 'HTTP=200' || { echo "::error::dev 스모크 실패: HTTP 200 이 아님"; exit 1; }
+          VER=$(echo "$LOGS" | grep -oE 'Version [0-9]+' | head -1)
+          {
+            echo "### dev 스모크 통과"
+            echo "- HTTP 200"
+            echo "- 응답 버전: ${VER:-확인 불가}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  deploy-prod:
+    name: prod 배포
+    needs: [preflight, smoke-dev]
+    runs-on: ubuntu-latest
+    outputs:
+      prev_image: ${{ steps.prev.outputs.image }}
+    environment:
+      name: prod        # Required reviewers 설정에 따라 배포 승인 대기가 걸린다.
+      url: http://10.1.0.7
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/login@v2
+        with:
+          client-id:       ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id:       ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: 현재 배포 이미지 기록
+        id: prev
+        run: |
+          out=$(az aks command invoke -g ${{ vars.AKS_RG }} -n ${{ vars.AKS_NAME }} \
+            --command "kubectl get deploy demo-web -n ${PROD_NS} -o jsonpath='{.spec.template.spec.containers[0].image}'" -o json)
+          PREV=$(echo "$out" | jq -r '.logs' | tr -d '\n')
+          echo "image=$PREV" >> "$GITHUB_OUTPUT"
+          echo "롤백 대상: $PREV"
+
+      - name: 매니페스트 렌더링
+        run: |
+          mkdir -p out
+          sed "s|REPLACE_ACR.azurecr.io/demo-web:v1|${{ needs.preflight.outputs.image }}|" \
+            k8s/deployment.yaml > out/deployment.yaml
+          cp k8s/service.yaml out/
+          grep -E "namespace:|image:" out/*.yaml
+
+      - name: 배포
+        working-directory: out
+        run: |
+          out=$(az aks command invoke -g ${{ vars.AKS_RG }} -n ${{ vars.AKS_NAME }} --file . \
+            --command "kubectl apply -f service.yaml -f deployment.yaml && kubectl rollout status deploy/demo-web -n ${PROD_NS} --timeout=180s" -o json)
+          echo "$out" | jq -r '.logs'
+          exit "$(echo "$out" | jq -r '.exitCode')"
+
+  smoke-prod:
+    name: prod 스모크 테스트
+    needs: [preflight, deploy-prod]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: azure/login@v2
+        with:
+          client-id:       ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id:       ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: 서비스 응답 확인
+        run: |
+          out=$(az aks command invoke -g ${{ vars.AKS_RG }} -n ${{ vars.AKS_NAME }} \
+            --command "kubectl exec deploy/demo-web -n ${PROD_NS} -- curl -sS -w '\nHTTP=%{http_code}\n' http://demo-web.${PROD_NS}.svc.cluster.local" -o json)
+          LOGS=$(echo "$out" | jq -r '.logs')
+          echo "$LOGS"
+          echo "$LOGS" | grep -q 'HTTP=200' || { echo "::error::prod 스모크 실패: HTTP 200 이 아님"; exit 1; }
+          VER=$(echo "$LOGS" | grep -oE 'Version [0-9]+' | head -1)
+          {
+            echo "### prod 스모크 통과"
+            echo "- HTTP 200"
+            echo "- 응답 버전: ${VER:-확인 불가}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  rollback:
+    name: 자동 롤백
+    needs: [deploy-prod, smoke-prod]
+    if: failure() && needs['deploy-prod'].result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: azure/login@v2
+        with:
+          client-id:       ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id:       ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: 직전 리비전으로 복구
+        run: |
+          out=$(az aks command invoke -g ${{ vars.AKS_RG }} -n ${{ vars.AKS_NAME }} \
+            --command "kubectl rollout undo deploy/demo-web -n ${PROD_NS} && kubectl rollout status deploy/demo-web -n ${PROD_NS} --timeout=180s" -o json)
+          echo "$out" | jq -r '.logs'
+          {
+            echo "### 스모크 실패로 자동 롤백 수행"
+            echo "- 롤백 전 이미지: \`${{ needs['deploy-prod'].outputs.prev_image }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit "$(echo "$out" | jq -r '.exitCode')"
+
+  summary:
+    name: 결과 요약
+    needs: [preflight, build, manifest-check, scan, deploy-dev, smoke-dev, deploy-prod, smoke-prod]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: 파이프라인 결과
+        run: |
+          {
+            echo "## 파이프라인 결과"
+            echo "| 단계 | 결과 |"
+            echo "|---|---|"
+            echo "| 준비 | ${{ needs.preflight.result }} |"
+            echo "| 이미지 빌드·푸시 | ${{ needs.build.result }} |"
+            echo "| 매니페스트 검증 | ${{ needs['manifest-check'].result }} |"
+            echo "| 취약점 스캔 | ${{ needs.scan.result }} |"
+            echo "| dev 배포 | ${{ needs['deploy-dev'].result }} |"
+            echo "| dev 스모크 | ${{ needs['smoke-dev'].result }} |"
+            echo "| prod 배포 | ${{ needs['deploy-prod'].result }} |"
+            echo "| prod 스모크 | ${{ needs['smoke-prod'].result }} |"
+            echo ""
+            echo "- 이미지: \`${{ needs.preflight.outputs.image }}\`"
+            echo "- 커밋: \`${{ github.sha }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,52 @@
+name: PR Validate
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+  id-token: write   # OIDC 토큰 발급. 없으면 azure/login 이 실패한다.
+
+jobs:
+  # job 이름이 Ruleset 의 Required status checks 이름과 일치해야 한다.
+  validate:
+    name: validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Docker build (푸시하지 않음)
+        run: docker build -t demo-web:pr-${{ github.event.pull_request.number }} ./app
+
+      - name: Azure 로그인
+        uses: azure/login@v2
+        with:
+          client-id:       ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id:       ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      # API 서버가 프라이빗이라 러너에서 직접 붙을 수 없다. command invoke 로 클러스터
+      # 안에서 서버 사이드 dry-run 을 돌린다. --dry-run=client 는 API 디스커버리가
+      # 필요해 kubeconfig 없이는 동작하지 않는다.
+      - name: 매니페스트 서버 사이드 검증
+        run: |
+          mkdir -p validate
+          cp k8s/service.yaml validate/
+          sed "s|REPLACE_ACR.azurecr.io/demo-web:v1|${{ vars.ACR_NAME }}.azurecr.io/demo-web:pr|" \
+            k8s/deployment.yaml > validate/deployment.yaml
+          cd validate
+          # az aks command invoke 는 클러스터 안 명령이 실패해도 CLI 자신은 exit 0 을
+          # 반환한다. exitCode 를 읽어 전파하지 않으면 검증 실패가 성공으로 보고된다.
+          out=$(az aks command invoke -g ${{ vars.AKS_RG }} -n ${{ vars.AKS_NAME }} --file . \
+            --command "kubectl apply --dry-run=server -f service.yaml -f deployment.yaml" -o json)
+          echo "$out" | jq -r '.logs'
+          exit "$(echo "$out" | jq -r '.exitCode')"
+
+      - name: 결과 요약
+        run: |
+          {
+            echo "### 검증 통과"
+            echo "- 이미지 빌드"
+            echo "- 매니페스트 서버 사이드 검증"
+          } >> "$GITHUB_STEP_SUMMARY"

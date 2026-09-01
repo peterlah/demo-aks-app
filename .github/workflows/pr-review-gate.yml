@@ -1,0 +1,97 @@
+name: PR Review Gate
+
+# 리뷰 제출 이벤트를 받아 PR 상태를 갱신한다.
+# GitHub Actions 는 이벤트 구동이므로 하나의 실행이 사람의 리뷰를 기다릴 수 없다.
+# PR 생성(pr-validate) → 리뷰 제출(이 워크플로) → 머지(cicd) 로 이어진다.
+on:
+  pull_request_review:
+    types: [submitted]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+env:
+  GH_TOKEN: ${{ github.token }}
+  PR: ${{ github.event.pull_request.number }}
+  REPO: ${{ github.repository }}
+  REVIEWER: ${{ github.event.review.user.login }}
+
+jobs:
+  approved:
+    name: 승인 처리
+    if: github.event.review.state == 'approved'
+    runs-on: ubuntu-latest
+    steps:
+      - name: 라벨 준비
+        run: |
+          gh label create ready-to-merge -R "$REPO" -c 1A7F37 -d "리뷰 승인 완료" --force
+          gh label create needs-work     -R "$REPO" -c BF8700 -d "수정 요청됨"   --force
+
+      - name: 상태 갱신
+        run: |
+          gh pr edit "$PR" -R "$REPO" --add-label ready-to-merge --remove-label needs-work
+
+          # 수정 요청으로 Draft 가 된 PR 이면 리뷰 가능 상태로 되돌린다.
+          if [ "$(gh pr view "$PR" -R "$REPO" --json isDraft --jq .isDraft)" = "true" ]; then
+            gh pr ready "$PR" -R "$REPO"
+            echo "Draft 해제"
+          fi
+
+      - name: 코멘트 작성
+        run: |
+          cat > /tmp/comment.md <<'MSG'
+          REVIEWER_PLACEHOLDER 님이 승인했습니다. 머지 가능한 상태입니다.
+
+          머지되면 `cicd` 워크플로가 시작되고 `prod` 환경에서 배포 승인이 한 번 더 필요합니다.
+          배포를 트리거한 사람은 자신의 배포를 승인할 수 없으므로, 머지한 사람과 배포 승인자는 서로 달라야 합니다.
+          MSG
+          sed -i "s/REVIEWER_PLACEHOLDER/@$REVIEWER/" /tmp/comment.md
+          gh pr comment "$PR" -R "$REPO" --body-file /tmp/comment.md
+
+      - name: 요약
+        run: |
+          {
+            echo "### 승인 처리 완료"
+            echo "- 리뷰어: $REVIEWER"
+            echo "- 라벨: ready-to-merge"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  changes-requested:
+    name: 수정 요청 처리
+    if: github.event.review.state == 'changes_requested'
+    runs-on: ubuntu-latest
+    steps:
+      - name: 라벨 준비
+        run: |
+          gh label create ready-to-merge -R "$REPO" -c 1A7F37 -d "리뷰 승인 완료" --force
+          gh label create needs-work     -R "$REPO" -c BF8700 -d "수정 요청됨"   --force
+
+      - name: 상태 갱신
+        run: |
+          gh pr edit "$PR" -R "$REPO" --add-label needs-work --remove-label ready-to-merge
+
+          # Draft 로 전환해 실수 머지를 막는다.
+          gh pr ready "$PR" -R "$REPO" --undo
+          echo "Draft 로 전환"
+
+      - name: 코멘트 작성
+        run: |
+          cat > /tmp/comment.md <<'MSG'
+          REVIEWER_PLACEHOLDER 님이 변경을 요청했습니다. 이 PR 은 Draft 로 전환되어 머지할 수 없습니다.
+
+          진행 방법
+          1. 지적 사항을 반영해 커밋 후 push
+          2. push 되면 `pr-validate` 가 다시 실행되고 기존 승인은 무효화됩니다
+          3. 다시 승인되면 Draft 가 해제되고 머지 가능한 상태로 돌아옵니다
+          MSG
+          sed -i "s/REVIEWER_PLACEHOLDER/@$REVIEWER/" /tmp/comment.md
+          gh pr comment "$PR" -R "$REPO" --body-file /tmp/comment.md
+
+      - name: 요약
+        run: |
+          {
+            echo "### 수정 요청 처리 완료"
+            echo "- 리뷰어: $REVIEWER"
+            echo "- 라벨: needs-work · PR 을 Draft 로 전환"
+          } >> "$GITHUB_STEP_SUMMARY"

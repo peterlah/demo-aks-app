@@ -1,0 +1,28 @@
+# L7 라우팅. AKS 앱 라우팅 애드온(관리형 NGINX)이 처리한다.
+#
+#  ★ ingressClassName 이 핵심
+#    애드온이 만드는 IngressClass 이름은 webapprouting.kubernetes.azure.com 으로 고정이다.
+#    이 값을 비우면 기본 IngressClass 가 없어 Ingress 가 아무 컨트롤러에도 잡히지 않고,
+#    ADDRESS 가 영원히 비어 있는 채로 남는다.
+#
+#  ★ 이 매니페스트는 파이프라인이 적용하지 않는다
+#    cicd.yml 은 service.yaml 과 deployment.yaml 만 명시해서 apply 한다.
+#    인그레스는 배포마다 바뀔 것이 없어 한 번만 수동 적용한다.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: demo-web
+  namespace: demo
+spec:
+  ingressClassName: webapprouting.kubernetes.azure.com
+  rules:
+    - host: demo.internal.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: demo-web
+                port:
+                  number: 80
